@@ -129,6 +129,12 @@ override fun onSaveInstanceState(outState: Bundle?) {
     super.onSaveInstanceState(outState)
 }
 ```
+对于系统组件，如fragment和view，他们都会保存有限的状态，
+比如 fragment会保存setArgments传递的参数以及某些实例相关的信息，然后在onCreate/onCreateView/onActivityCreated等方法中恢复；view会保存一些自己的状态信息，如输入的文本、光标的位置、选中的状态或者滚动的位置等等。
+如果想要view保存自身的状态，需要为它指定唯一id。
+自定义View时，也应该考虑到这一点。
+
+
 ## 启动模式
 | LaunchMode | 说明 |
 |----------|-----|
