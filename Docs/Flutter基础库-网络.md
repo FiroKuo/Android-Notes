@@ -72,6 +72,155 @@
 3. 当`im`发送消息时，实际上就是通过`session`的`sendMessage`方法实现的，然后等待响应；
 4. 等服务端响应后，更新数据库中消息的发送/已读状态；
 
+## `Socket`和`WebSocket`
+最开始，长连接是通过`Socket`实现的，创建连接以及监听消息如下：
+```dart
+ Future<Socket?> _doConnectionInterval() async {
+    if (this.addressArr.length == 0) {
+      bool res = await this.setAddress(ClientConfig.shareConfig().getKrpcAddress());
+      if (!res) {
+        return null;
+      }
+    }
+    socketId++;
+    onConnectingMethod();
+    SocketAddress address = this.addressArr[addressArrayIndex];
+    try {
+      var tempSocket = await Socket.connect(address.address, address.port,
+          timeout: Duration(milliseconds: ClientConfig.shareConfig().getConnectTimeout()));
+      tempSocket.setOption(SocketOption.tcpNoDelay, true);
+      tempSocket.listen(onDataMethod, onError: onErrorMethod, onDone: onDoneMethod, cancelOnError: false);
+      _isFlush = false;
+      onConnectedMethod();
+      return tempSocket;
+    } catch (error) {
+      onConnectFailedMethod(error);
+      addressArrayIndex++;
+      if (addressArrayIndex >= addressArr.length) {
+        addressArrayIndex = 0;
+      }
+      return null;
+    }
+}
+```
+
+发送消息：
+```dart
+void sendData(List<int> data) async {
+//    try{
+//      this.socket.add(data);
+//      await this.socket.flush();
+//      Log.i("KrpcSessionManager", "socket sendData: ${data.length}");
+//    }catch(error){
+//      this.sendDataOnErrorMethod(error);
+//    }
+
+    if (_isFlush) {
+      Future.delayed(Duration(milliseconds: 1000), () {
+        this.sendData(data);
+      });
+    } else {
+      _isFlush = true;
+      try {
+        this.socket!.add(data);
+        await this.socket!.flush();
+        // Log.d("KrpcSessionManager", "socket sendData: ${data.length}");
+      } catch (error) {
+        this.sendDataOnErrorMethod(error);
+      }
+      _isFlush = false;
+    }
+}
+```
+断开连接：
+```dart
+Future disconnection() async {
+    if (this.socket == null) {
+      return;
+    }
+    if (this.socket != null) {
+      try {
+        await this.socket!.close();
+        this.socket!.destroy();
+      } catch (error) {}
+    }
+    this.socket = null;
+    onDisconnectMethod();
+}
+```
+
+后来，改成了`Websocket`，创建连接以及监听消息：
+```dart
+Future<bool> doConnection() async {
+    String? netWorkType = await NetUtil.networkType;
+    if (netWorkType == "NotReachable" || netWorkType == "NO_NETWORK") {
+      Log.e("WsSessionManager", "doConnection networkUnavailable");
+      return false;
+    }
+    _webSocket = await _doConnectionInterval();
+    if (_webSocket == null) {
+      return false;
+    }
+    _webSocketChannel = IOWebSocketChannel(_webSocket!);
+    _webSocketChannel!.stream.listen(onDataMethod, onError: onErrorMethod, onDone: onDoneMethod, cancelOnError: false);
+    return true;
+  }
+```
+```dart
+  Future<WebSocket?> _doConnectionInterval() async {
+    if (_socketAddress.isEmpty) {
+      _socketAddress = ClientConfig.shareConfig().getWebSocketAddress();
+      if (_socketAddress.isEmpty) {
+        return null;
+      }
+    }
+    socketId++;
+    onConnectingMethod();
+    try {
+      WebSocket tempSocket = await WebSocket.connect(_socketAddress, protocols:['krpcjson']);
+      onConnectedMethod();
+      return tempSocket;
+    } catch (error) {
+      onConnectFailedMethod(error);
+      return null;
+    }
+  }
+```
+发送消息：
+```dart
+void sendData(String message) async {
+    if (_webSocketChannel != null) {
+      _webSocketChannel!.sink.add(message);
+    } else {
+      sendDataOnErrorMethod("webSocketChannel is null");
+    }
+}
+```
+断开连接：
+```dart
+Future disconnection() async {
+    if (_webSocket == null) {
+      return;
+    }
+    try {
+      await _webSocketChannel?.sink.close();
+    } catch (error) {
+      Log.e("WsSessionManager", "socket onCloseError: $error");
+    }
+    _webSocket = null;
+    _webSocketChannel = null;
+    onDisconnectMethod();
+}
+```
+从`Socket`切换为`WebSocket`的原因可能并不是性能或者稳定行考量。事实上两者可能就是Api、对数据的处理有差异。切换的原因可能是服务端的要求。
+
+## MQTT
+项目最开始使用的是MQTT，这是一个开源库: https://github.com/eclipse/paho.mqtt.android
+MQTT起了一个Service，作为长连接的实现基础。
+本身MQTT支持很多协议，比方说ssl、websocket等，功能还是比较强大的。
+但是貌似没有看到消息重发等健壮性的逻辑，这可能给人的印象是消息丢失、不稳定的原因。不过也没有详细看过源代码，也不太确定。
+
+
 # 网路库
 ## 类图：
 ![](images/http.png)
