@@ -447,7 +447,3 @@ val newsFragment = fragmentProviders["news"]?.getFragment()
 
 ## 总结
 综上，目前的项目虽说没有完全的实现组件化，但其实已经做了大部分的工作，包括业务组件、功能组件的划分，不同组件之间的路由、方法调用，这些都很好的符合和规范；项目欠缺的一是独立打包运行和集成测试，这其中其实包含了职责、权限的划分，建议使用多工程模式；一是对`Service module`的处理，目前是所有的业务模块的抽象接口都放到了`Service module`中，每个人都能修改这个模块，容易导致混乱以及职责划分不清的问题，其实也可以再次改造，为需要提供服务的`module`抽象出`export_module`以解决这个问题；整体进一步改造的难度不大。日常需求迭代中，要严格遵守组件化的思想和规范，多考虑一下设计和合理性，让组件化的架构可以持续。
-
-# Jetpack
-项目中使用了部分jetpack组件，但也没有严格按照google给出的最佳变成实践去做，主要是`ViewBinding/DataBinding`+`ViewModel`+`Repository`+`RequestFactory`。
-项目中大量使用了`DataBinding`，无论是列表还是某组件的信息展示，列表主要依赖开源库(https://github.com/evant/binding-collection-adapter)，普通的组件就是`ObservableField`/`ObservableBoolean`..或者`LiveData`/`MutableLiveData`
