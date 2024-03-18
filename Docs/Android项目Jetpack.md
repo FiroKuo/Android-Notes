@@ -805,4 +805,86 @@ public void onItemBind(@NonNull ItemBinding itemBinding, int position, T item) {
         binding.clearExtras().set(BR.homework, R.layout.soa_item_home_work)
     }
 ```
-这里的`binding`其实就是最外层的`ItemBinding`，调用`set`方法后，会覆盖为当前position的`variableId`和`layoutRes`，那么，在不断调用`OnBindViewHolder`绑定数据的时候，绑定的就是当前position的ItemView的数据了。
+这里的`binding`其实就是最外层的`ItemBinding`，调用`set`方法后，会覆盖为当前position的`variableId`和`layoutRes`，那么，在不断调用`OnBindViewHolder`绑定数据的时候，绑定的就是当前position的`ItemViewType`的数据了。
+
+#### 刷新数据问题
+前面提到，如果想要使用`adapter`中非全量刷新的方法，可以让数据集是`ObservableList`类型的，这样它就可以被观察，`adapter`会调用对应的`notifyXxx`方法。如果想要完全自定义刷新逻辑，那可以考虑数据集直接使用`List`，自己调用`adapter`的`notifyXxx`方法。
+
+之前其实还遇到过一个问题，有时候我们想无感刷新列表（不想有一个先消失在出现的感知），但列表数量有时候可能发生改变，如果先`list.clear`再`list.addAll`，不能只调用一次`adapter.notifyItemRangeChanged`，这个方法其实是`items`的改变，并不涉及到数量的改变，如果手动先调用`notifyItemRangeRemoved`再调用`notifyItemRangeInsert`可能会有明显的视觉效果和闪动，这不是我们想要的。
+
+更好的办法是`DiffUtil`，我们需要实现`DiffUtil.Callback`：
+```java
+public class MyDiffUtilCallback extends DiffUtil.Callback {
+
+    List<String> oldList;
+    List<String> newList;
+
+    public MyDiffUtilCallback(List<String> oldList, List<String> newList) {
+        this.oldList = oldList;
+        this.newList = newList;
+    }
+
+    @Override
+    public int getOldListSize() {
+        return oldList.size();
+    }
+
+    @Override
+    public int getNewListSize() {
+        return newList.size();
+    }
+
+    @Override
+    public boolean areItemsTheSame(int oldItemPosition, int newItemPosition) {
+        // 在这里实现你的逻辑来判断两个对象是否代表同一个Item
+        // 例如，如果你的items有唯一的id字段，可以在这里比较它们的id
+        return oldList.get(oldItemPosition).equals(newList.get(newItemPosition));
+    }
+
+    @Override
+    public boolean areContentsTheSame(int oldItemPosition, int newItemPosition) {
+        // 在这里判断两个item是否含有相同的数据
+        // 你可以比较他们的详细内容，以确定它们是否完全一样
+        return oldList.get(oldItemPosition).equals(newList.get(newItemPosition));
+    }
+}
+```
+然后，在更新数据的时候使用`DiffUtil.calculateDiff`计算`DiffUtil.DiffResult`，并调用它的`dispatchUpdatesTo`:
+```java
+List<String> oldList = adapter.getDataList(); // 获取旧数据列表
+List<String> newList = ... // 这是你新的数据列表
+
+DiffUtil.DiffResult diffResult = DiffUtil.calculateDiff(new MyDiffUtilCallback(oldList, newList));
+
+// 更新数据源
+adapter.setDataList(newList);
+
+// 将差异结果应用到Adapter上
+diffResult.dispatchUpdatesTo(adapter);
+```
+
+对于我们这里的`databinding`，也提供了`diffConfig`属性:
+```java
+if (diffConfig != null && items != null) {
+    AsyncDiffObservableList<T> list = (AsyncDiffObservableList<T>) recyclerView.getTag(R.id.bindingcollectiondapter_list_id);
+    if (list == null) {
+        list = new AsyncDiffObservableList<>(diffConfig);
+        recyclerView.setTag(R.id.bindingcollectiondapter_list_id, list);
+        adapter.setItems(list);
+    }
+    list.update(items);
+} else {
+    adapter.setItems(items);
+}
+```
+如果指定了`diffConfig`属性，则会创建`AsyncDiffObservableList`，上面说到`setItems`会为`ObservableList`设置监听，调用`adapter`对应的`notifyXxx`方法，这种情况是直接修改源列表的情况；如果想使用`Diff`刷新数据，则源数据可以使用`ObservableFiled<List>`，然后每次更新数据的时候都创建`new List`, 这样最终会调用`list.update`:
+```java
+public AsyncDiffObservableList(@NonNull AsyncDifferConfig<T> config) {
+    differ = new AsyncListDiffer<>(new ObservableListUpdateCallback(), config);
+}
+
+public void update(@Nullable List<T> newItems) {
+    differ.submitList(newItems);
+}
+```
+这样就触发了`Diff`的更新。
