@@ -221,6 +221,34 @@ class OrderStatusNotifier extends StateNotifier<OrderStatus> {
 ```
 当其他地方需要监听订单状态变化时，仅需关注`orderStatusProvider`，当有其他页面或者`Provider`需要监听订单详情中的部分数据变化时，仅需关注`orderDetailProvider`，分工明确。
 
+注意，在`orderDetailProvider`中如果某次接口请求失败，我们不直接返回`null`数据，而是复用上次的数据，否则页面就会展示*默认状态*，这个是要避免的：
+```dart
+///请求订单详情
+///这里使用`copyWithPrevious`，出错的时候复用之前的数据
+Future<void> request(String orderId) async {
+  if (orderId.isEmpty) return;
+  // state = const AsyncValue<OrderDetailRes>.loading().copyWithPrevious(state);
+  try {
+    final response = await ChargeDetailApi.getOrderDetail(orderId);
+    final isSuccess = response.item1 == 0;
+    final detail = response.item2;
+    final message = response.item3;
+    if (isSuccess && detail != null) {
+      state = AsyncValue.data(detail);
+    } else {
+      state = AsyncValue<OrderDetailRes>.error(message, StackTrace.empty)
+          .copyWithPrevious(state);
+      ChargeDetailLogger.error("订单详情获取失败: $message");
+    }
+  } catch (e) {
+    state = AsyncValue<OrderDetailRes>.error(e.toString(), StackTrace.current)
+        .copyWithPrevious(state);
+    ChargeDetailLogger.error("订单详情获取失败: ${e.toString()}");
+  }
+}
+```
+`AsyncValue<OrderDetailRes>.error(message, StackTrace.empty).copyWithPrevious`本身是一个`error`，但它也包含`data`，也就是说我们通过`valueOrNull`是可以取出来数据的。
+
 ## 页面切换
 充电状态的切换意味着页面的切换，页面可以分为上下两部分：页面内容和底部操作区域，`flutter`中并没有`fragment`的概念，为了让页面自动响应状态，这里创建了`chargePageProvider`和`chargeNavigatorProvider`来提供上下两部分的`widget`，如果像是*启动充电中*这种状态，底部不需要要操作区域，`chargeNavigatorProvider`直接返回`Container`即可，这两个`Provider`监听了`orderStatusProvider`，当状态发生变化时，自动切换页面:
 ```dart
@@ -457,14 +485,13 @@ ref.listen(
             data: (info) {
                 final success = info.item1 == 0;
                 if (!success && ModalRoute.of(context)?.isCurrent == true) {
-                Navigator.pop(context, info.item3);
+                  Navigator.pop(context, info.item3);
                 }
     },
     error: (error, stack) {
         // debugPrint("停止充电异常：$error");
-        //因为stopChargeProvider是一个futureProvider，所以第一次listen的时候会执行它的逻辑。
-        //如果这里pop掉，那就没办法处理订单自己停止的场景 弹框弹不出来
-        //当自动停止的时候，StopBtnStatus.normal，stopChargeProvider不需要再次发起endCharge
+        //因为stopChargeProvider是一个futureProvider，所以第一次listen的时候会执行它的逻辑。那就不能写`if (state == StopBtnStatus.normal) throw Exception("状态异常");`那自动停止就会调用`endCharge`方法。
+        //反之，如果这里pop掉，那就没办法处理订单自己停止的场景(自动停止按钮状态不会变化，仍为 StopBtnStatus.normal) 弹框弹不出来
         // if (ModalRoute.of(context)?.isCurrent == true) {
         //   Navigator.pop(context, error.toString());
         // }
@@ -473,13 +500,16 @@ ref.listen(
     );
 });
 ```
-此外，注意一下自动停止，如果接口返回停止中的状态，这个时候不需要我们手动调用`endCharge`，在`stopChargeProvider`中我们判断了按钮的状态:
+此外，注意一下*自动停止*，如果接口返回停止中的状态，这个时候不需要我们手动调用`endCharge`，在`stopChargeProvider`中我们判断了按钮的状态:
 ```dart
 final state = ref.watch(chargingStopStateProvider);
 //当自动停止的时候，按钮状态为StopBtnStatus.normal，stopChargeProvider不需要主动发起endCharge
 if (state == StopBtnStatus.normal) throw Exception("状态异常");
 ```
-还有一点，就是对`stopChargeProvider`所抛出的异常的处理，这里我们不需要处理任何异常分支，上边的注释解释了这一情况，我们依赖订单状态改变销毁弹出，而不是`endCharge`调用异常。
+还有一点，就是对`stopChargeProvider`所抛出的异常的处理，这里我们不需要处理任何异常分支，上边的注释解释了这一情况。我们依赖订单状态改变销毁弹出，而不是`endCharge`调用异常。
+
+### 停止中和账单生成中状态的切换
+关于如何从停止中切换到账单生成中，`StopChargingDialog`是**复用**的，因为两者的弹框数据都是本地的，我们在弹框中监听`status`的改变即可，当`status`改变时，弹框的数据会刷新，达到切换状态的目的。
 
 ## 账单刷新
 待支付需要拉取收银台的信息`querySettlePaymentInfo`，刷新的时机有以下两种：
@@ -549,15 +579,245 @@ Future<void> _request(StateNotifierProviderRef ref, String orderId, CouponSelect
 ```
 
 ## 选择优惠券
+收银台的优惠券数据是`queryPaymentInfo`一起返回的，默认勾选的优惠券/限时优惠存放在`couponDetailList`，用户充电券列表存放在`chargeCouponList`中，可以用前者匹配后者的默认选中:
+```dart
+if (isSuccess && payment != null) {
+      state = AsyncValue.data(payment);
+      ref
+          .read(couponSelectedProvider.notifier)
+          .defaultCoupon(payment.couponDetailList);
+    } else {
+      state = AsyncValue.error(message, StackTrace.empty);
+      ref.read(couponSelectedProvider.notifier).defaultCoupon(null);
+    }
+```
+我们使用`couponSelectedProvider`来管理优惠券的选中状态，值得注意的是，上边我们有提到，收银台刷新的条件之一就是优惠券选中状态发生变化，**为了避免循环触发优惠券选中-刷新收银台**我们在`CouponSelected`对象中使用`isDefault`标志是否是收银台数据请求后的默认选中，然后，在触发收银台刷新的位置判断:
+```dart
+ ref.listen(couponSelectedProvider, (previous, next) {
+    //获取预付信息后，会给selectProvider赋值，避免刷新
+    if (next?.isDefault == true) return;
+    final status = ref.read(orderStatusProvider);
+    final orderNo = ref.read(chargeOrderInfoProvider)?.orderNo ?? "";
+    final coupon = next;
+    _prepare(ref, status, orderNo, coupon);
+  });
+```
+选择优惠券的时候，是否可以点击是根据充电券列表中的`status`字段判断状态的，`any status == 1` 则说明有可选的优惠券，把`chargeCouponList` map 为个人优惠券列表模块的数据格式，然后由个人优惠券列表渲染，选择完毕后返回`batchId`和`couponId`，从`chargeCouponList`中匹配选中的对象，调用`couponSelectedProvider`的`select`方法设置优惠券，触发收银台的数据刷新:
+```dart
+///选中优惠券
+void select(int couponId, int batchId) {
+  final chargeCoupons =
+      _ref?.read(paymentChargeCouponsProvider) ?? List.empty();
+  ChargeCoupon? selected;
+  for (int i = 0; i < chargeCoupons.length; i++) {
+    final coupon = chargeCoupons[i];
+    if (coupon.couponId == couponId && coupon.batchId == batchId) {
+      selected = coupon;
+      ChargeDetailLogger.info("选中优惠券: $coupon");
+      break;
+    }
+  }
+  if (mounted) {
+    state = CouponSelected(
+      selected,
+      selectedCoupon: selected == null ? 2 : 1,
+      isDefault: false,
+    );
+  }
+}
+```
 
-## 支付
+## 结算
+订单存在自动结算的情况，比方说预付的钱花完了，退款为0的情况，这种情况下可能不会进入待结算状态。反之如果有退款，则可能需要用户手动点击结算按钮，这个时候会发起结算，我们使用`payBtnStatusProvider`这个`StateProvider`来标志按钮点击状态:
+```dart
+ ///发起结算
+void _settlement(context) {
+  ref.read(payBtnStatusProvider.notifier).state = PayBtnStatus.paying;
+}
+```
+当多次点击按钮的时候，因为状态已经是`PayBtnStatus.paying`，并不会多次触发状态更新。我们在`Widget`中监听状态的变化，展示按钮的文案以及`loading`，在`makeChargePayProvider`中监听状态变化，触发真正的
+结算接口调用：
+```dart
+MakeChargePayNotifier(StateNotifierProviderRef ref)
+    : super(const AsyncValue.loading()) {
+    //监听按钮的状态
+    //使用listen是因为支付成功后不会将PayBtnStatus改为PayBtnStatus.normal(避免再次点击)
+    //而支付成功后，会刷新详情，进而触发页面build，如果用watch的话这里的构造函数会刷新，再次执行_makePay
+    ref.listen(payBtnStatusProvider, (previous, next) {
+        if (PayBtnStatus.paying == next) {
+          ChargeDetailLogger.info("监听到支付按钮点击，发起支付: $next");
+          _makePay(ref);
+        }
+      });
+    //...
+}
+```
+当发起支付成功后，要轮询查询支付状态，轮询时间间隔为1.5s:
+```dart
+/// 轮询
+void _periodic(StateNotifierProviderRef ref, String payOrderId) {
+  _timer?.cancel();
+  _stream?.close();
+  _stream = StreamController();
+  _stream?.stream.listen((event) {
+    if (mounted) {
+      state = event;
+    }
+  });
+  _timer = Timer.periodic(_duration, (timer) async {
+    final status = ref.read(orderStatusProvider);
+    //状态已经发生变化
+    if (!OrderStatus.isPay(status.state)) {
+      ChargeDetailLogger.info("订单状态已经发生变化,取消支付状态查询的轮询");
+      _timer?.cancel();
+      _stream?.close();
+      if (mounted) {
+        state = const AsyncValue.data(null);
+      }
+      return;
+    }
+    if (!(await _queryPayStatus(ref, payOrderId))) {
+      _timer?.cancel();
+      _stream?.close();
+    }
+  });
+}
+```
+注意，轮询过程中*要多次判断当前订单状态*`final status = ref.read(orderStatusProvider);`，不止是轮询开始，包括接口请求结束都需要判断最新订单状态，如果不是待支付，则取消轮询。还有一点，在使用`FutureProvider`的时候，`AsyncValue`的状态包括`AsyncValue.loading`、`AsyncValue.error`、`AsyncValue.data`都是框架判断返回的，你不能自己`return AsyncValue.error()`，这是不生效的，想要触发`AsyncValue.error`只能`throw exception`，这中特点是`FutureProvider`特有的。
 
-## 充电结束
+## 充电结束/充电异常
+充电结束直接复用的是结算页面`ChargeChargingPage`，只不过这个状态底部没有操作区，其实是`chargeNavigatorProvider`直接返回`null`，这样会渲染为`Container`，底部就不会展示内容了。充电结束收银台信息仍然是调用`queryPaymentInfo`获取账单信息。账单内容展示有些条目是有差异的，这个都是根据`status`判断的；充电结束不能选择优惠券，充电结束不会订阅订单消息。
+
+充电异常是复用的充电中的页面`ChargeChargingPage`，是指`eventCode`是-1000的情况；9000是取消状态，是个预留状态，目前并没有对应的页面展示这种状态。异常和充电中这两种页面布局十分相似，大多数都是UI的差异，我们使用`ThemeUtil`依据`status`处理这些差异情况。异常状态底部按钮点击会触发联系客服，调用原生进行拨号。异常状态不会订阅订单消息。
 
 ## 体验优化
+由于订单详情有两种背景，黑色(启动充电、充电中、充电异常)和白色(待结算、订单完成)，我们打开订单详情的时候，不太好使用一种默认的背景，因为你也不知道此时订单状态是什么，这样会造成页面闪动的问题，用户体验不太好。我们使用一个**透明的中间页面**来请求订单详情，比方说，在订单列表中点击，这个时候会先跳转到透明页面`ChargeDetailSpringboard`，请求订单详情数据，但这个页面不会立即展示`loading`，而是延迟2s，如果订单详情在此期间返回数据，就不会展示`loading`了；除此之外，订单详情接口本身请求也有时间限制，如果5s内没有获取到数据，网络不太顺畅，则会`Toast`网络异常并关闭透明页面:
+```dart
+///预加载数据
+void _preload() {
+  _loadingTask = _showLoading();
+  _preloadTask = ChargeDetailApi.getOrderDetail(widget.orderId)
+      .timeout(_max)
+      .then((value) {
+    final response = value.item2;
+    ChargeDetailInit.instance.init(res: response);
+    setState(() {
+      _loading = false;
+    });
+    _navigator();
+  }).catchError((error) {
+    setState(() {
+      _loading = false;
+    });
+    ChargeDetailInit.instance.clear();
+    SCToastUtils.error(context, "网络异常");
+    Navigator.pop(context);
+  });
+}
 
-
-# riverpod
+Future<void> _showLoading() => Future.delayed(_delay, () {
+    setState(() {
+      _loading = true;
+    });
+});
+```
+这个页面的结构很简单，它根据`_loading`变量展示隐藏`LoadingWidget`:
+```dart
+@override
+Widget build(BuildContext context) {
+  return Scaffold(
+    backgroundColor: Colors.transparent,
+    body: Center(
+      child: Visibility(
+        visible: _loading,
+        child: SCLoading.loadingWidget(),
+      ),
+    ),
+  );
+}
+```
+进入订单详情的来源大致可以分为两类，一类是正常下单流程中从始至终走进入详情，一类就是从其他入口打开订单详情了。对于前一种情况，要求把从首页到详情中间所有的页面出栈，我们使用`clearTop`标志这种情况:
+```dart
+//对于正常下单流程 详情返回需要pop到首页
+if (widget.clearTop) {
+  Navigator.pushAndRemoveUntil(
+      context,
+      MaterialPageRoute(
+        settings: const RouteSettings(
+          name: OrderDetailManager.detailRouteDirect,
+        ),
+        builder: (context) => ChargeDetailScope(widget.orderId),
+      ), (route) {
+    debugPrint("clear Top: ${route.settings.name}");
+    if (route.settings.name == CR.chargeHome) {
+      debugPrint("clear Top stop: ${route.settings.name}");
+      return true;
+    }
+    return false;
+  });
+} else {
+  Navigator.pushReplacement(
+    context,
+    MaterialPageRoute(
+      settings: const RouteSettings(
+        name: OrderDetailManager.detailRouteDirect,
+      ),
+      builder: (context) => ChargeDetailScope(widget.orderId),
+    ),
+  );
+}
+```
+如果是`clearTop`，我们需要判断路由，是不是`CR.chargeHome`，不是则关闭页面，所以，为相应的页面设置路由很重要；如果一个页面需要判断页面路由，则需要为其设置路由，一种情况是我们使用框架中的`RouterApi`的`openFlutterPage`，这种情况我们已经在框架中统一添加了当前页面的路由，`saic_flutter_app.dart`中的`push`方法:
+```dart
+if (withContainer) {
+    final container =
+        _createContainer(pageInfo, first, backgroundTransparent);
+    containers.add(container);
+    // FocusManager.instance.primaryFocus?.unfocus();
+    refreshOnPush(container);
+  } else {
+    if (!transparentRoute) {
+      topContainer.navigator?.push(MaterialPageRoute(
+          builder: (context) {
+            return first!;
+          },
+          settings: RouteSettings(name: pageName),
+          fullscreenDialog: fullscreenDialog));
+    } else {
+      topContainer.navigator?.push(TransparentRoute(
+          builder: (context) {
+            return first!;
+          },
+          settings: RouteSettings(name: pageName)));
+    }
+}
+```
+如果是直接从`flutter`中打开页面，则走`else`的逻辑，我们增加了`settings: RouteSettings(name: pageName)`，`pageName`即为`path`；如果是原生打开`flutter`页面，`witchContainer`是`true`，最终会创建`ContainerOverlayEntry`，它对应的`Widget`其实是`StateWidget`，我们在`build`方法中为其添加路由:
+```dart
+@override
+Widget build(BuildContext context) {
+  return HeroControllerScope(
+    controller: HeroController(),
+    child: Navigator(
+        key: widget.container?._navKey,
+        onGenerateRoute: (RouteSettings routeSettings) {
+          return MaterialPageRoute<dynamic>(
+              settings: RouteSettings(
+                name: widget.container?.pageInfo?.pageName ??
+                    routeSettings.name,
+                arguments: routeSettings.arguments,
+              ),
+              builder: (context) {
+                return widget.container?.firstWidget ??
+                    Container(
+                      color: Colors.white,
+                    );
+              });
+        }),
+  );
+}
+```
+还有一种情况是项目中自己使用`Navigator.push`打开页面，如果这个页面会被判断路由，则要手动为其增加路由，这一点要注意。
 
 # 充电弹窗
 充电弹窗设计类似于原生，均参考`okhttp`拦截器的责任链设计，优点是可以自定义弹窗组合、弹窗顺序，提供继续弹窗和中断弹窗的接口，外部可以选择1次弹窗或者按场景触发弹窗而不会创建多个弹窗链。
