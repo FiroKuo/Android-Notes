@@ -332,4 +332,55 @@ private fun requestWeChatAuthCode() {
 
 长连接是在进程启动后就创建的，不止用于行程中订单状态变更，对于`Android`来说，还是一种推送方案，比如某些手机厂商没有推送，则后台会有降级方案，在长连接连接后推送消息。
 
-整个应用中其实有两个长连接存在，一个是应用启动时创建的，一个是IM消息长连接，并不是复用的，IM创建连接时是重新创建的`websocket connection`。
+整个应用中其实有两个长连接存在，一个是应用启动时创建的，一个是IM消息长连接，并不是复用的，IM创建连接时是重新创建的`websocket connection`。IM长连接创建的时机是`flutter engine`初始化时，执行`main.dart`的过程中，进行im模块的初始化。
+
+只有进入到`trip`模块才会开始订阅长连接，所谓的订阅其实就是判断消息的类型和消息的`orderId`是不是当前订单，除此之外还会判断`timestamp`，只有时间有变化，是较新的，才会通知到下游。
+
+## flutter-center/flutter-impl
+前者是flutter混合工程，包括flutter的入口函数、flutter sub modules的注册、http的header同步等。后者是原生调用flutter功能的入口，定义了一些flutter模块交互的方法，其实是封装了原生与flutter的交互过程，对外透明。
+
+当App启动时，会预热flutter引擎，执行flutter-center中的`main.dart`，虽然无感知，但是futter是一直运行在后台的，当打开一个页面的时候，会把flutter和`FlutterView`绑定，这个时候才看到Flutter的内容。当再次打开一个FlutterActivity时，flutter视图会从第一个容器中脱离，与第二个容器的FlutterView绑定，由于我们的FlutterApp的特点，其实不同的Flutter页面是放在`Overlay`中的，类似一个FrameLayout，页面叠加在一起；当从第二个容器返回的时候，首先第二个Flutter页面出栈，然后会重新把当前Flutter视图关联到第一个容器的FlutterView中，页面重新展示出来。
+
+原生与Flutter交互无非就是打开页面、调用方法，都是通过`channel`完成的，当某个Flutter业务模块向原生提供服务的时候，原生需要注册`channel`，实现`MethodCallHandler`。当然，这里是优化的，对所有的flutter与原生的交互，只需提供`native2FlutterChannel`和`flutter2NativeChannel`，具体的方法调用可以再分发。调用的时候会给到一个callback:`MethodChannel.Result`，可以返回给flutter结果。
+
+## main
+`main`模块里有几件重要的事情：设置页面、本地协议弹框/全屏协议弹框、对`Schame`的处理。
+设置页面后来由原生改为flutter了，具体的设置选项是配置的，我们仍需知道配置的keys来处理不同的逻辑，并且仅解析当前版本已知的key，实现版本兼容。
+
+本地协议弹框是应用首次打开，内容是本地的，因为要做合规，只有同意协议我们才会初始化大部分组件，包括网络框架。设置页面可以撤回协议，协议撤回后，要清理sp数据，中断原生和flutter的数据上报，然后清理任务栈，启动新的任务栈，打开全屏协议授权页面:
+```kotlin
+private fun restartTheWorld() {
+    startActivity(
+        Intent(
+            this@PrivacySettingActivity,
+            ProtocolActivity::class.java
+        ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
+    finishAffinity()
+}
+```
+全屏协议授权页面和本地授权协议弹窗类似，如果不同意，则直接退出App。
+除此之外，首页每次`resume`的时候都会检查最新的协议弹窗，这个协议弹窗的内容加载的是接口返回的h5连接，底部协议列表也是后台返回的，如果不同意，则会退出App；对于其他业务线，也有对应的协议弹框，往往在业务线内部或者入口处弹出，不同意则退出业务线。
+
+这其实就涉及到了主协议和第三方协议，这些都是可以在设置中手动撤销的，如果撤销主协议，就会走上述撤销逻辑。如果撤销第三方协议，则下次进入第三方业务线，会重新弹出协议。
+
+解析`schame`需要使用`SchameActivity`，它在`intent-filter`中定义了`data android:scheme=`协议并声明了`action`：
+```xml
+<action android:name="android.intent.action.VIEW" />
+<category android:name="android.intent.category.DEFAULT" />
+<category android:name="android.intent.category.BROWSABLE" />
+```
+如果是第三方app拉起我们的应用，或者小部件点击，都会打开这个页面做中转。起初这个页面是透明的，后来为了适配Android12 splash，它的背景现在是开屏页的背景。这个页面首先判断主页面是否已经打开，没有的话会拉起主页面后，延迟到主页面处理`intent.data`这个`uri`，否则，直接处理这个`uri`，这其实是热启动和冷启动的区别。
+
+使用`SchemeManager`处理`uri`，因为`webview`的`interceptUrl`、`push`的点击也会复用这个逻辑，基本也都是打开h5页面或者natvie页面。
+
+## order-status
+这个模块是`trip`与`event-reciever`中间层，其实封装了一系列的消息订阅过程。
+
+## trip
+trip模块即为行程，是项目中大多数业务线行程复用的模块，也是很重要的一个模块。行程中的状态大致分为：等待应答、等待接驾、司机到站、行程中、待支付、订单完成、订单取消。订单详情是一个`activity`，内部包含`fragments`，每一个`fragment`对应一种行程中的状态，当收到长连接或者轮询到的订单消息，会判断当前页面展示，切换页面；它还包含一个地图页面，用来绘制上下车点、途径点的`marker`、小车图标、以及司乘同显，`activity`提供`mapControl`的获取方法，这样，在各个状态切换的时候，`fragment`中能自主绘制内容。
+
+等待应答有追加车级的功能，客户端会有计时，达到配置的时间就会请求可追加的车级，还有加价调度的功能，后台会推送附近可接单司机，这个是通过长连接来实现的。等待应答地图元素比较简单，只有起点`marker`和水波纹动画，但所有的页面都要注意一下聚焦问题，`zoomArray`可以指定聚焦内容，上下左右的留白，地图元素是不能被底部内容遮挡的。当然，等待应答页面还要处理超时没有任何司机响应的状况。
+
+等待接驾页面需要聚焦司机和起点，并且绘制司乘同显，`sctx`类型需要查询接口，`sctx`本身需要配置不少东西，比如起终点、小车图片、订单号、callback等等，
